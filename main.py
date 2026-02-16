@@ -5,32 +5,12 @@ from core.column_classifier import classify_columns
 from core.unit_parser import extract_quantity_and_unit
 from core.unit_normalizer import normalize_quantity
 from core.price_calculator import calculate_standard_price, clean_price
+from core.ai_extractor import extract_with_gemini
+import pandas as pd
 
 
 INPUT_FOLDER = "input_files"
-
-def main():
-    files = list_input_files(INPUT_FOLDER)
-    print("Archivos detectados:", files)
-
-    if not files:
-        print("No se encontraron archivos.")
-        return
-
-    for file in files:
-        print("Procesando:", file)
-
-        provider = detect_provider(file)
-        df = extract_table(file)
-
-        column_map = classify_columns(df.columns.tolist())
-
-        if not column_map["producto"] or not column_map["precio"]:
-            print("⚠️ No se pudieron detectar columnas obligatorias.")
-            continue
-
-        producto_col = column_map["producto"]
-        precio_col = column_map["precio"]
+def procesar_dataframe(df, producto_col="producto", precio_col="precio"):
 
         df["cantidad_normalizada"] = None
         df["unidad_estandar"] = None
@@ -38,30 +18,10 @@ def main():
         df["origen_precio"] = None
 
         for idx, row in df.iterrows():
-            producto = row[producto_col]
 
-            precio_unit = None
-            origen_precio = None
-
-            # 1️⃣ Intentar precio unitario directo (si existe)
-            if "precio unitario" in df.columns:
-                precio_unit = clean_price(row.get("precio unitario"))
-                if precio_unit:
-                    origen_precio = "unitario"
-
-            # 2️⃣ Si no hay unitario válido, usar precio caja / uxb
-            if (precio_unit is None or precio_unit == 0) and "precio caja" in df.columns and "uxb" in df.columns:
-                precio_caja = clean_price(row.get("precio caja"))
-                uxb = row.get("uxb")
-
-                if precio_caja and uxb and uxb != 0:
-                    precio_unit = precio_caja / uxb
-                    origen_precio = "caja_dividido"
-
-            # 3️⃣ Fallback: usar la columna precio detectada automáticamente
-            if precio_unit is None:
-                precio_unit = clean_price(row.get(precio_col))
-                origen_precio = "columna_detectada"
+            producto = row.get(producto_col)
+            precio_unit = clean_price(row.get(precio_col))
+            origen_precio = "directo"
 
             cantidad, unidad, pack = extract_quantity_and_unit(producto)
             cantidad_norm, unidad_std = normalize_quantity(cantidad, unidad, pack)
@@ -75,9 +35,51 @@ def main():
             df.at[idx, "precio_estandar"] = precio_estandar
             df.at[idx, "origen_precio"] = origen_precio
 
-        output_path = f"output_{provider}.csv"
+        return df
 
-                # --- DETECCIÓN DE OUTLIERS ---
+
+def main():
+    files = list_input_files(INPUT_FOLDER)
+    print("Archivos detectados:", files)
+
+    if not files:
+        print("No se encontraron archivos.")
+        return
+
+    for file in files:
+        print("Procesando:", file)
+
+        provider = detect_provider(file)
+        used_ai = False
+
+        if file.lower().endswith(".pdf"):
+            print("📄 Usando Gemini para PDF...")
+            df = extract_with_gemini(file)
+
+            if df is None:
+                print("❌ Gemini no pudo procesar el archivo.")
+                continue
+
+            used_ai = True
+
+            # En PDFs asumimos que Gemini devuelve "producto" y "precio"
+            df = procesar_dataframe(df, "producto", "precio")
+
+        else:
+            df = extract_table(file)
+
+            column_map = classify_columns(df.columns.tolist())
+
+            if not column_map["producto"] or not column_map["precio"]:
+                print("⚠️ No se pudieron detectar columnas obligatorias.")
+                continue
+
+            producto_col = column_map["producto"]
+            precio_col = column_map["precio"]
+
+            df = procesar_dataframe(df, producto_col, precio_col)
+
+        # 📊 OUTLIERS
         precios_validos = df["precio_estandar"].dropna()
 
         if len(precios_validos) > 0:
@@ -88,22 +90,21 @@ def main():
             lower_bound = q1 - 1.5 * iqr
             upper_bound = q3 + 1.5 * iqr
 
-            def detectar_outlier(valor):
-                if valor is None:
-                    return None
-                if valor < lower_bound or valor > upper_bound:
-                    return "OUTLIER"
-                return "OK"
-
-            df["flag_outlier"] = df["precio_estandar"].apply(detectar_outlier)
+            df["flag_outlier"] = df["precio_estandar"].apply(
+                lambda x: "OUTLIER" if pd.notnull(x) and (x < lower_bound or x > upper_bound) else "OK"
+            )
         else:
             df["flag_outlier"] = None
 
+        df["procesado_con_ia"] = used_ai
+
+        output_path = f"output_{provider}.csv"
         df.to_csv(output_path, index=False, decimal=".")
 
         print(f"Archivo procesado guardado como {output_path}")
 
 
-if __name__ == "__main__":
-    main()
 
+if __name__ == "__main__":
+    
+    main()
